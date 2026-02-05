@@ -1,3 +1,16 @@
+# TO DO LIST 
+
+Figure out how to get the video frames "blink" app into the script (likely upload the videos after they are saved or Blinkpy)
+
+implemment the idea that there is no time limit to flag the clip, but we flag a clip anytime an object A in the sink set stays there until the end of the day and is not removed. so we can find the clip where object A was put in.
+
+use the blinkpy library to have the clips send after they are saved.
+
+Draw the polygon on the sink, based on where camera is.
+
+Test the cup and bowl moving out of the polygon.
+
+
 # SUMMARY of the detections script
 1. The Core Logic: "Strict Boundary" Rules
 
