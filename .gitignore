@@ -1,0 +1,33 @@
+# --- SENSITIVE DATA (Blink & Security) ---
+# Do NOT commit your login tokens or credentials
+blink_auth.json
+.env
+secrets.json
+
+# --- AI & VIDEO DATA ---
+# Ignore the actual videos (they are too large for Git)
+*.mp4
+*.avi
+*.mov
+/blink_clips/
+/dish_videos/
+
+# Ignore the heavy YOLO model weights (downloaded automatically)
+*.pt
+*.onnx
+/runs/
+/datasets/
+
+# --- PYTHON CLUTTER ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- SYSTEM FILES ---
+.DS_Store
+Thumbs.db
