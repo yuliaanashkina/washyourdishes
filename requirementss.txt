@@ -1,0 +1,19 @@
+# Core AI & Vision
+ultralytics==8.4.9
+torch==2.10.0
+torchvision==0.25.0
+opencv-python==4.13.0.90
+numpy==2.4.1
+
+# Blink API & Network
+aiohttp==3.13.3
+aiofiles==25.1.0
+requests==2.32.5
+
+# Data Handling & Math
+polars==1.37.1
+scipy==1.17.0
+matplotlib==3.10.8
+
+# Install blinkpy from the dev branch (This is the special one)
+git+https://github.com/fronzbot/blinkpy.git@dev
