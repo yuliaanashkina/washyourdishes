@@ -14,41 +14,30 @@ OUTPUT_DIR = "./dish_videos"
 DEFAULT_SINCE_HOURS = 24 * 7
 
 async def setup_blink():
-    # 1. Initialize session separately so we can close it correctly later
+    # 1. Initialize session
     session = ClientSession()
-    blink = Blink(session=session)
-
-    # 2. Check if we have saved credentials
-    if os.path.exists(CRED_FILE):
-        print(f"--- Loading saved credentials from {CRED_FILE} ---")
-        creds = await json_load(CRED_FILE)
-        blink.auth = Auth(creds, no_prompt=True)
-    else:
-        print("--- No saved credentials found. Starting first-time login ---")
-        username = input("Enter Blink Email: ")
-        password = input("Enter Blink Password: ")
-        blink.auth = Auth({"username": username, "password": password})
-
-    # 3. Start the system with improved 2FA handling
+    # Using a try block so the finally block ALWAYS closes the session
     try:
-        await blink.start()
-    except Exception as e:
-        print(f"Initial connection result: {e}")
-        # Force the 2FA prompt if we aren't fully started
-        if not blink.available:
-            print("Attempting 2FA verification...")
-            await blink.prompt_2fa()
-            # Re-start after 2FA
-            await blink.start()
-        else:
-            print(f"Login failed: {e}")
-            await session.close()
-            return
+        blink = Blink(session=session)
 
-    # 4. Save credentials for next time
-    if not os.path.exists(CRED_FILE):
-        await blink.save(CRED_FILE)
-        print(f"Credentials saved to {CRED_FILE}. Move this file to your cluster later!")
+        # 2. Check credentials
+        if os.path.exists(CRED_FILE):
+            print(f"--- Loading saved credentials from {CRED_FILE} ---")
+            creds = await json_load(CRED_FILE)
+            blink.auth = Auth(creds, no_prompt=True)
+        else:
+            print("--- No saved credentials found ---")
+            username = input("Enter Blink Email: ")
+            password = input("Enter Blink Password: ")
+            blink.auth = Auth({"username": username, "password": password})
+
+        # 3. Start system
+        await blink.start()
+
+        # 4. Save credentials if new
+        if not os.path.exists(CRED_FILE):
+            await blink.save(CRED_FILE)
+            print(f"Credentials saved to {CRED_FILE}.")
 
     # 5. Refresh and list cameras
     print("Refreshing camera data...")
