@@ -1,5 +1,6 @@
 import asyncio
 import os
+from datetime import datetime, timedelta
 from aiohttp import ClientSession
 from blinkpy.blinkpy import Blink
 from blinkpy.auth import Auth
@@ -8,6 +9,8 @@ from blinkpy.helpers.util import json_load
 # Configuration
 CRED_FILE = "blink_auth.json"
 OUTPUT_DIR = "./dish_videos"
+# How far back to look for clips (Blink app shows these; API returns them by time)
+DEFAULT_SINCE_MINUTES = 10
 
 async def setup_blink():
     # 1. Initialize session
@@ -35,53 +38,35 @@ async def setup_blink():
             await blink.save(CRED_FILE)
             print(f"Credentials saved to {CRED_FILE}.")
 
-        # 5. Refresh data 
-        print("Refreshing camera data...")
-        await blink.refresh()
-        
-        # --- NEW: Aggressive Video Sync ---
-        print("Synchronizing video manifest...")
-        # This reaches into the internal sync module logic to find clips
-        for sync_name, sync_module in blink.sync.items():
-            await sync_module.refresh() 
-        # ----------------------------------
+    # 5. Refresh and list cameras
+    print("Refreshing camera data...")
+    await blink.refresh()
 
-        print("\nConnected! Found Cameras:")
-        for name, camera in blink.cameras.items():
-            print(f"- {name}")
-            
-            # Check the library's internal 'last_record' attribute
-            # Sometimes 'camera.clip' is empty but the last_record is populated
-            last_clip = getattr(camera, 'last_record', None)
-            print(f"  > Camera Clip Attribute: {camera.clip}")
-            print(f"  > Last Record Attribute: {last_clip}")
+    print("\nConnected! Found Cameras:")
+    for name, camera in blink.cameras.items():
+        print(f"  - {name} (Battery: {camera.battery})")
 
-            if not os.path.exists(OUTPUT_DIR):
-                os.makedirs(OUTPUT_DIR)
-            
-            print(f"  > Attempting download...")
-            # We use 'stop=5' to look back at the last 5 clips 
-            # in case the 'latest' one is still processing.
-            await blink.download_videos(
-                OUTPUT_DIR, 
-                stop=5, 
-                camera=name, 
-                delay=2
-            )
-            
-            # Check if files appeared
-            if os.listdir(OUTPUT_DIR):
-                print(f"  > Success! Files found: {os.listdir(OUTPUT_DIR)}")
-            else:
-                print(f"  > Still no files. This suggests the API is not sharing the manifest.")
+    # 6. Download clips using the time-based API (same clips you see in the Blink app)
+    # video_to_file() often fails with "no saved video" because Blink's API doesn't
+    # populate the per-camera "last clip" field; download_videos(since=...) works.
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
 
+    since_dt = datetime.now() - timedelta(minutes=DEFAULT_SINCE_MINUTES)
+    since_str = since_dt.strftime("%Y/%m/%d %H:%M")
+    print(f"\nDownloading clips since {since_str} (last {DEFAULT_SINCE_MINUTES} minutes)...")
+    print(f"Clips will be saved to: {OUTPUT_DIR}\n")
+
+    try:
+        await blink.download_videos(OUTPUT_DIR, since=since_str, camera="all", delay=1)
+        count = sum(1 for f in os.listdir(OUTPUT_DIR) if f.endswith(".mp4"))
+        print(f"\nDone. {count} clip(s) in {OUTPUT_DIR}")
     except Exception as e:
-        print(f"\n[!] AN ERROR OCCURRED: {e}")
-    
-    finally:
-        # 6. This runs no matter what, preventing the "Unclosed session" warning
-        print("\n--- Closing session safely ---")
-        await session.close()
+        print(f"Download error: {e}")
+        print("If you see no clips: check your Blink subscription (cloud clip retention) and that clips exist in the app for this period.")
+
+    # 7. Close the session
+    await session.close()
 
 if __name__ == "__main__":
     asyncio.run(setup_blink())
