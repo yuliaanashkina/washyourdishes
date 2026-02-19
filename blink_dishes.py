@@ -10,34 +10,44 @@ from blinkpy.helpers.util import json_load
 CRED_FILE = "blink_auth.json"
 OUTPUT_DIR = "./dish_videos"
 # How far back to look for clips (Blink app shows these; API returns them by time)
-# Use hours; e.g. 24 * 7 for 7 days, or 1/6 for ~10 minutes
-DEFAULT_SINCE_HOURS = 24 * 7
+DEFAULT_SINCE_HOURS = 24 * 7  # 7 days; increase if you need older clips
 
 async def setup_blink():
-    # 1. Initialize session
+    # 1. Initialize session separately so we can close it correctly later
     session = ClientSession()
-    # Using a try block so the finally block ALWAYS closes the session
+    blink = Blink(session=session)
+
+    # 2. Check if we have saved credentials
+    if os.path.exists(CRED_FILE):
+        print(f"--- Loading saved credentials from {CRED_FILE} ---")
+        creds = await json_load(CRED_FILE)
+        blink.auth = Auth(creds, no_prompt=True)
+    else:
+        print("--- No saved credentials found. Starting first-time login ---")
+        username = input("Enter Blink Email: ")
+        password = input("Enter Blink Password: ")
+        blink.auth = Auth({"username": username, "password": password})
+
+    # 3. Start the system with improved 2FA handling
     try:
-        blink = Blink(session=session)
-
-        # 2. Check credentials
-        if os.path.exists(CRED_FILE):
-            print(f"--- Loading saved credentials from {CRED_FILE} ---")
-            creds = await json_load(CRED_FILE)
-            blink.auth = Auth(creds, no_prompt=True)
-        else:
-            print("--- No saved credentials found ---")
-            username = input("Enter Blink Email: ")
-            password = input("Enter Blink Password: ")
-            blink.auth = Auth({"username": username, "password": password})
-
-        # 3. Start system
         await blink.start()
+    except Exception as e:
+        print(f"Initial connection result: {e}")
+        # Force the 2FA prompt if we aren't fully started
+        if not blink.available:
+            print("Attempting 2FA verification...")
+            await blink.prompt_2fa()
+            # Re-start after 2FA
+            await blink.start()
+        else:
+            print(f"Login failed: {e}")
+            await session.close()
+            return
 
-        # 4. Save credentials if new
-        if not os.path.exists(CRED_FILE):
-            await blink.save(CRED_FILE)
-            print(f"Credentials saved to {CRED_FILE}.")
+    # 4. Save credentials for next time
+    if not os.path.exists(CRED_FILE):
+        await blink.save(CRED_FILE)
+        print(f"Credentials saved to {CRED_FILE}. Move this file to your cluster later!")
 
     # 5. Refresh and list cameras
     print("Refreshing camera data...")
@@ -55,7 +65,7 @@ async def setup_blink():
 
     since_dt = datetime.now() - timedelta(hours=DEFAULT_SINCE_HOURS)
     since_str = since_dt.strftime("%Y/%m/%d %H:%M")
-    print(f"\nDownloading clips since {since_str} (last {DEFAULT_SINCE_HOURS} hours)...")
+    print(f"\nDownloading clips since {since_str} (last {DEFAULT_SINCE_HOURS // 24} days)...")
     print(f"Clips will be saved to: {OUTPUT_DIR}\n")
 
     try:
