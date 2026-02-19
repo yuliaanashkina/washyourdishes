@@ -10,7 +10,8 @@ from blinkpy.helpers.util import json_load
 CRED_FILE = "blink_auth.json"
 OUTPUT_DIR = "./dish_videos"
 # How far back to look for clips (Blink app shows these; API returns them by time)
-DEFAULT_SINCE_MINUTES = 10
+# Use hours; e.g. 24 * 7 for 7 days, or 1/6 for ~10 minutes
+DEFAULT_SINCE_HOURS = 24 * 7
 
 async def setup_blink():
     # 1. Initialize session separately so we can close it correctly later
@@ -63,9 +64,9 @@ async def setup_blink():
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
 
-    since_dt = datetime.now() - timedelta(minutes=DEFAULT_SINCE_MINUTES)
+    since_dt = datetime.now() - timedelta(hours=DEFAULT_SINCE_HOURS)
     since_str = since_dt.strftime("%Y/%m/%d %H:%M")
-    print(f"\nDownloading clips since {since_str} (last {DEFAULT_SINCE_MINUTES} minutes)...")
+    print(f"\nDownloading clips since {since_str} (last {DEFAULT_SINCE_HOURS} hours)...")
     print(f"Clips will be saved to: {OUTPUT_DIR}\n")
 
     try:
