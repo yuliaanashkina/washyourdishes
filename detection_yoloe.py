@@ -1,3 +1,7 @@
+"""
+Detection script using YOLO-World (open-vocabulary) with text prompts:
+cups, bowls, and pans. Same sink-tracking logic as detection.py.
+"""
 import cv2
 import json
 import numpy as np
@@ -9,13 +13,14 @@ from datetime import datetime
 from ultralytics import YOLO
 
 # --- CONFIGURATION ---
-# COCO class IDs: 41=cup, 45=bowl. (COCO has no "pan" - use custom model for pans.)
-TARGET_CLASSES = [41, 45]  # Cup, Bowl
+# YOLO-World: prompt-based classes (no COCO IDs). Detects cups, bowls, pans.
+PROMPT_CLASSES = ["cup", "bowl", "pan"]
 ALERT_THRESHOLD = 5
-# Optional: add more COCO IDs to also detect (e.g. 39=wine glass). Pans are not in COCO.
 DISH_VIDEOS_DIR = "./dish_videos"
 SINK_POLYGON_FILE = "sink_polygon.json"
 DEBUG = False  # Set True or use --debug for verbose per-frame logging
+# YOLO-World model (s=small, m=medium, l=large). First run downloads weights.
+YOLOWORLD_MODEL = "yolov8s-world.pt"
 
 # Blink filenames look like: mini-2-0eew-2026-02-19t01-21-26-00-00.mp4
 BLINK_FNAME_PATTERN = re.compile(
@@ -48,7 +53,6 @@ def get_video_paths_by_names(names):
         n = n.strip()
         if not n:
             continue
-        # Allow bare filename or path that ends with the filename
         base = os.path.basename(n)
         if base in available:
             resolved.append(os.path.join(DISH_VIDEOS_DIR, base))
@@ -73,7 +77,6 @@ def get_videos_from_dish_videos(since_dt=None):
             continue
         path = os.path.join(DISH_VIDEOS_DIR, f)
         if since_dt is not None:
-            # Prefer timestamp from Blink-style filename
             mo = BLINK_FNAME_PATTERN.search(f)
             if mo:
                 y, m, d, h, mi, s = map(int, mo.groups())
@@ -100,18 +103,28 @@ def is_point_in_sink(point, polygon):
     return cv2.pointPolygonTest(polygon, (point[0], point[1]), False) >= 0
 
 
+def _get_class_name(model, cls_id):
+    """Resolve class index to name (works for both dict and list model.names)."""
+    cid = int(cls_id)
+    names = model.names
+    if isinstance(names, dict):
+        return names.get(cid, f"class_{cid}")
+    if isinstance(names, (list, tuple)) and 0 <= cid < len(names):
+        return names[cid]
+    return f"class_{cid}"
+
+
 def process_video(video_path, clip_index=None, clip_name=None, model=None):
     """
     Process one video and track dishes in/out of sink polygon.
-    clip_index and clip_name are for reporting (e.g. "Clip 1: tuzar_dish_in1.mp4").
-    If model is provided, reuse it so track IDs persist across clips (same dish = same ID).
-    Returns dict with: in_sink_at_end, entered_this_clip, left_this_clip.
+    Uses YOLO-World model with prompt classes (cup, bowl, pan).
     """
     global sink_inventory
     clip_index = clip_index if clip_index is not None else 0
     clip_name = clip_name or os.path.basename(video_path)
     if model is None:
-        model = YOLO('yolov8n.pt')
+        model = YOLO(YOLOWORLD_MODEL)
+        model.set_classes(PROMPT_CLASSES)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -133,7 +146,8 @@ def process_video(video_path, clip_index=None, clip_name=None, model=None):
         frame_idx += 1
         frame = cv2.resize(frame, (800, 600))
         current_time = time.time()
-        results = model.track(frame, persist=True, classes=TARGET_CLASSES, verbose=False)
+        # YOLO-World: no classes= arg; model already has set_classes(["cup","bowl","pan"])
+        results = model.track(frame, persist=True, verbose=False)
 
         current_frame_ids = set()
         if results[0].boxes.id is not None:
@@ -149,8 +163,7 @@ def process_video(video_path, clip_index=None, clip_name=None, model=None):
                 center_point = (int((x1 + x2) / 2), int((y1 + y2) / 2))
                 in_sink = is_point_in_sink(center_point, sink_polygon)
 
-                # Label: cup, bowl, etc. from model class names
-                class_name = model.names.get(int(cls_id), f"class_{cls_id}")
+                class_name = _get_class_name(model, cls_id)
 
                 if in_sink:
                     cv2.rectangle(frame, (xi1, yi1), (xi2, yi2), (0, 0, 255), 2)
@@ -158,18 +171,18 @@ def process_video(video_path, clip_index=None, clip_name=None, model=None):
                         sink_inventory[tid] = {'entry_time': current_time, 'status': 'VISIBLE'}
                         entered_this_clip.add(tid)
                         if DEBUG:
-                            print(f"  [DEBUG] frame {frame_idx} track_id={tid} center={center_point} -> ENTERED sink")
+                            print(f"  [DEBUG] frame {frame_idx} track_id={tid} {class_name} center={center_point} -> ENTERED sink")
                     elif DEBUG and frame_idx % 30 == 0:
-                        print(f"  [DEBUG] frame {frame_idx} track_id={tid} center={center_point} -> in sink (still)")
+                        print(f"  [DEBUG] frame {frame_idx} track_id={tid} {class_name} -> in sink (still)")
                 else:
                     cv2.rectangle(frame, (xi1, yi1), (xi2, yi2), (0, 255, 0), 2)
                     if tid in sink_inventory:
                         left_this_clip.add(tid)
                         del sink_inventory[tid]
                         if DEBUG:
-                            print(f"  [DEBUG] frame {frame_idx} track_id={tid} center={center_point} -> LEFT sink")
+                            print(f"  [DEBUG] frame {frame_idx} track_id={tid} {class_name} center={center_point} -> LEFT sink")
 
-                # Draw label above box for every cup/bowl
+                # Label: cup, bowl, pan + track id
                 label = f"{class_name} #{tid}"
                 (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                 cv2.rectangle(frame, (xi1, yi1 - th - 4), (xi1 + tw, yi1), (0, 0, 0), -1)
@@ -177,7 +190,7 @@ def process_video(video_path, clip_index=None, clip_name=None, model=None):
 
         # Draw UI
         cv2.polylines(frame, [sink_polygon], True, (255, 255, 0), 2)
-        cv2.imshow("Blink Dish Monitor", frame)
+        cv2.imshow("YOLO-World Dish Monitor", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
@@ -197,7 +210,6 @@ def process_video(video_path, clip_index=None, clip_name=None, model=None):
     if left_this_clip:
         for tid in sorted(left_this_clip):
             print(f"  Dish {tid} left the set during this clip.")
-    # One-line state summary (always) and detailed debug (when DEBUG)
     print(f"  Summary: in_sink_now={sorted(in_sink_at_end)} | entered_this_clip={sorted(entered_this_clip)} | left_this_clip={sorted(left_this_clip)}")
     if DEBUG:
         print(f"  [DEBUG] in_sink_at_start={sorted(in_sink_at_start)}")
@@ -215,12 +227,15 @@ if __name__ == "__main__":
         run_calibration()
         sys.exit(0)
 
-    # --debug enables per-frame debug logging
     if "--debug" in sys.argv or "-d" in sys.argv:
         globals()["DEBUG"] = True
         print("[DEBUG] Verbose per-frame logging enabled.")
 
-    # 1. Video selection: by name (--videos / -v) or by time / all
+    # Build model once with prompt classes (cups, bowls, pans)
+    print(f"Loading YOLO-World ({YOLOWORLD_MODEL}) with prompts: {PROMPT_CLASSES}")
+    model = YOLO(YOLOWORLD_MODEL)
+    model.set_classes(PROMPT_CLASSES)
+
     video_list = []
     argv = sys.argv[1:]
     if "--videos" in argv or "-v" in argv:
@@ -240,7 +255,7 @@ if __name__ == "__main__":
                     print(f"  {f}")
                 sys.exit(1)
         else:
-            print("Usage: python detection.py --videos video1.mp4 video2.mp4 video3.mp4")
+            print("Usage: python detection_yoloe.py --videos video1.mp4 video2.mp4 video3.mp4")
             sys.exit(1)
     else:
         user_time = input("Enter start time (YYYY/MM/DD HH:MM) or video names (comma-separated) or press Enter for all: ").strip()
@@ -248,7 +263,6 @@ if __name__ == "__main__":
             video_list = get_videos_from_dish_videos(since_dt=None)
             print("Using all videos in dish_videos.")
         elif "," in user_time or user_time.endswith(".mp4") or not user_time[0].isdigit():
-            # Treat as video names
             names = [n.strip() for n in user_time.split(",") if n.strip()]
             video_list, missing = get_video_paths_by_names(names)
             if missing:
@@ -269,7 +283,6 @@ if __name__ == "__main__":
         sys.exit(1)
 
     print(f"Processing {len(video_list)} video(s) in order (track IDs persist across clips).")
-    model = YOLO('yolov8n.pt')
     for i, path in enumerate(video_list, start=1):
         name = os.path.basename(path)
         process_video(path, clip_index=i, clip_name=name, model=model)
