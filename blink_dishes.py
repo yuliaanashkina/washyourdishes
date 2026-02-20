@@ -10,7 +10,7 @@ from blinkpy.helpers.util import json_load
 CRED_FILE = "blink_auth.json"
 OUTPUT_DIR = "./dish_videos"
 # How far back to look for clips (Blink app shows these; API returns them by time)
-DEFAULT_SINCE_HOURS = 1  # 7 days; increase if you need older clips
+DEFAULT_SINCE_HOURS = 10  # 7 days; increase if you need older clips
 
 async def setup_blink():
     # 1. Initialize session separately so we can close it correctly later
