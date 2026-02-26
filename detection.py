@@ -99,114 +99,88 @@ def get_sink_polygon():
 def is_point_in_sink(point, polygon):
     return cv2.pointPolygonTest(polygon, (point[0], point[1]), False) >= 0
 
-
 def process_video(video_path, clip_index=None, clip_name=None, model=None):
-    """
-    Process one video and track dishes in/out of sink polygon.
-    clip_index and clip_name are for reporting (e.g. "Clip 1: tuzar_dish_in1.mp4").
-    If model is provided, reuse it so track IDs persist across clips (same dish = same ID).
-    Returns dict with: in_sink_at_end, entered_this_clip, left_this_clip.
-    """
     global sink_inventory
     clip_index = clip_index if clip_index is not None else 0
     clip_name = clip_name or os.path.basename(video_path)
+
     if model is None:
-        model = YOLO('yolov8n.pt')
+        model = YOLO(YOLOWORLD_MODEL)
+        # Note: set_classes is expensive; usually done once outside this function
+        model.set_classes(["white ceramic bowl", "clear cup", "mug", "pot", "pan", "white plate"])
 
     cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"[ERROR] Could not open video: {video_path}")
-        return {"in_sink_at_end": set(), "entered_this_clip": set(), "left_this_clip": set()}
-
     sink_polygon = get_sink_polygon()
-    in_sink_at_start = set(sink_inventory.keys())
-    entered_this_clip = set()
-    left_this_clip = set()
-
     frame_idx = 0
-    print(f"\n[Clip {clip_index}] Processing: {clip_name}")
 
     while cap.isOpened():
         ret, frame = cap.read()
-        if not ret:
-            break
+        if not ret: break
         frame_idx += 1
-        frame = cv2.resize(frame, (800, 600))
-        current_time = time.time()
-        results = model.track(frame, persist=True, classes=TARGET_CLASSES, verbose=False)
 
-        current_frame_ids = set()
-        if results[0].boxes.id is not None:
+        if frame_idx % 4 != 0: continue 
+
+        frame = cv2.resize(frame, (800, 600))
+        
+        # 1. Tracker Call
+        results = model.track(frame, persist=True, verbose=False, conf=0.1, iou=0.5)
+
+        items_in_sink = []
+        items_outside = []
+
+        # 2. Logic: Process detections if they exist
+        if results[0].boxes is not None and results[0].boxes.id is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy()
             track_ids = results[0].boxes.id.int().cpu().numpy()
             clss = results[0].boxes.cls.int().cpu().numpy()
 
-            for box, track_id, cls_id in zip(boxes, track_ids, clss):
-                tid = int(track_id)
-                current_frame_ids.add(tid)
+            for box, tid, cls_id in zip(boxes, track_ids, clss):
                 x1, y1, x2, y2 = box
-                xi1, yi1, xi2, yi2 = int(x1), int(y1), int(x2), int(y2)
-                center_point = (int((x1 + x2) / 2), int((y1 + y2) / 2))
-                in_sink = is_point_in_sink(center_point, sink_polygon)
-
-                # Label: cup, bowl, etc. from model class names
-                class_name = model.names.get(int(cls_id), f"class_{cls_id}")
-
+                center = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+                in_sink = is_point_in_sink(center, sink_polygon)
+                name = _get_class_name(model, cls_id)
+                
+                label = f"{name} #{tid}"
                 if in_sink:
-                    cv2.rectangle(frame, (xi1, yi1), (xi2, yi2), (0, 0, 255), 2)
-                    if tid not in sink_inventory:
-                        sink_inventory[tid] = {'entry_time': current_time, 'status': 'VISIBLE'}
-                        entered_this_clip.add(tid)
-                        if DEBUG:
-                            print(f"  [DEBUG] frame {frame_idx} track_id={tid} center={center_point} -> ENTERED sink")
-                    elif DEBUG and frame_idx % 30 == 0:
-                        print(f"  [DEBUG] frame {frame_idx} track_id={tid} center={center_point} -> in sink (still)")
+                    items_in_sink.append(label)
+                    sink_inventory[tid] = {'status': 'active'}
+                    color = (0, 0, 255) # Red
                 else:
-                    cv2.rectangle(frame, (xi1, yi1), (xi2, yi2), (0, 255, 0), 2)
-                    if tid in sink_inventory:
-                        left_this_clip.add(tid)
-                        del sink_inventory[tid]
-                        if DEBUG:
-                            print(f"  [DEBUG] frame {frame_idx} track_id={tid} center={center_point} -> LEFT sink")
+                    items_outside.append(label)
+                    # For debugging, maybe don't delete immediately? 
+                    if tid in sink_inventory: del sink_inventory[tid]
+                    color = (0, 255, 0) # Green
 
-                # Draw label above box for every cup/bowl
-                label = f"{class_name} #{tid}"
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                cv2.rectangle(frame, (xi1, yi1 - th - 4), (xi1 + tw, yi1), (0, 0, 0), -1)
-                cv2.putText(frame, label, (xi1, yi1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                # Draw boxes on the frame
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+                cv2.putText(frame, label, (int(x1), int(y1)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
 
-        # Draw UI
+        # 3. DRAW UI SIDEBAR
+        # Create a solid sidebar on a copy of the frame
+        sidebar_w = 220
+        # Draw a semi-transparent black box
+        cv2.rectangle(frame, (0, 0), (sidebar_w, 600), (0, 0, 0), -1)
+        # Add a white divider line
+        cv2.line(frame, (sidebar_w, 0), (sidebar_w, 600), (255, 255, 255), 1)
+
+        # TEXT RENDERING (Drawing directly on 'frame' so it's always on top)
+        cv2.putText(frame, f"FRAME: {frame_idx}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        cv2.putText(frame, "--- IN SINK ---", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        for i, item in enumerate(items_in_sink[:8]): # Increased limit to 8
+            cv2.putText(frame, item, (15, 100 + (i*25)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        cv2.putText(frame, "--- OUTSIDE ---", (10, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        for i, item in enumerate(items_outside[:8]):
+            cv2.putText(frame, item, (15, 350 + (i*25)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        # Draw sink boundary
         cv2.polylines(frame, [sink_polygon], True, (255, 255, 0), 2)
-        cv2.imshow("Blink Dish Monitor", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+
+        cv2.imshow("Dish Monitor Debugger", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
 
     cap.release()
-    in_sink_at_end = set(sink_inventory.keys())
-
-    # Per-clip summary
-    print(f"\n--- After clip {clip_index} ({clip_name}) ---")
-    if in_sink_at_end:
-        for tid in sorted(in_sink_at_end):
-            print(f"  Dish {tid} is in the set.")
-    else:
-        print("  No dishes in the set.")
-    if entered_this_clip:
-        for tid in sorted(entered_this_clip):
-            print(f"  Dish {tid} entered the set during this clip.")
-    if left_this_clip:
-        for tid in sorted(left_this_clip):
-            print(f"  Dish {tid} left the set during this clip.")
-    # One-line state summary (always) and detailed debug (when DEBUG)
-    print(f"  Summary: in_sink_now={sorted(in_sink_at_end)} | entered_this_clip={sorted(entered_this_clip)} | left_this_clip={sorted(left_this_clip)}")
-    if DEBUG:
-        print(f"  [DEBUG] in_sink_at_start={sorted(in_sink_at_start)}")
-
-    return {
-        "in_sink_at_end": in_sink_at_end,
-        "entered_this_clip": entered_this_clip,
-        "left_this_clip": left_this_clip,
-    }
 
 # --- MAIN EXECUTION ---
 if __name__ == "__main__":

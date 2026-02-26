@@ -14,7 +14,7 @@ from ultralytics import YOLO
 
 # --- CONFIGURATION ---
 # YOLO-World: prompt-based classes (no COCO IDs). Detects cups, bowls, pans.
-PROMPT_CLASSES = ["cup", "bowl", "pan"]
+PROMPT_CLASSES = ["white ceramic bowl", "clear cup", "mug", "pot", "pan", "white plate"]
 ALERT_THRESHOLD = 5
 DISH_VIDEOS_DIR = "./dish_videos"
 SINK_POLYGON_FILE = "sink_polygon.json"
@@ -112,113 +112,126 @@ def _get_class_name(model, cls_id):
     if isinstance(names, (list, tuple)) and 0 <= cid < len(names):
         return names[cid]
     return f"class_{cid}"
-
-
 def process_video(video_path, clip_index=None, clip_name=None, model=None):
-    """
-    Process one video and track dishes in/out of sink polygon.
-    Uses YOLO-World model with prompt classes (cup, bowl, pan).
-    """
     global sink_inventory
     clip_index = clip_index if clip_index is not None else 0
     clip_name = clip_name or os.path.basename(video_path)
+
     if model is None:
         model = YOLO(YOLOWORLD_MODEL)
-        model.set_classes(PROMPT_CLASSES)
+        model.set_classes(["white ceramic bowl", "clear cup", "mug", "pot", "pan", "white plate"])
+
+    # --- 1. PREPARE LIGHTING NORMALIZATION (CLAHE) ---
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
     cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"[ERROR] Could not open video: {video_path}")
-        return {"in_sink_at_end": set(), "entered_this_clip": set(), "left_this_clip": set()}
+    original_sink_poly = get_sink_polygon()
+    
+    # --- 2. CALCULATE CROP BOX ---
+    sx, sy, sw, sh = cv2.boundingRect(original_sink_poly)
+    pad = 60 
+    x1, y1 = max(0, sx - pad), max(0, sy - pad)
+    x2, y2 = min(800, sx + sw + pad), min(600, sy + sh + pad)
+    
+    # Adjust the polygon for the crop
+    sink_poly_cropped = original_sink_poly - [x1, y1]
 
-    sink_polygon = get_sink_polygon()
-    in_sink_at_start = set(sink_inventory.keys())
-    entered_this_clip = set()
-    left_this_clip = set()
+    # Pre-calculate scaling for the display
+    view_w = 650
+    view_h = 600
+    scale_x = view_w / (x2 - x1)
+    scale_y = view_h / (y2 - y1)
+    sink_poly_scaled = (sink_poly_cropped * [scale_x, scale_y]).astype(np.int32)
 
     frame_idx = 0
-    print(f"\n[Clip {clip_index}] Processing: {clip_name}")
-
     while cap.isOpened():
         ret, frame = cap.read()
-        if not ret:
-            break
+        if not ret: break
         frame_idx += 1
-        frame = cv2.resize(frame, (800, 600))
-        current_time = time.time()
-        # YOLO-World: no classes= arg; model already has set_classes(["cup","bowl","pan"])
-        results = model.track(frame, persist=True, verbose=False)
+        if frame_idx % 4 != 0: continue 
 
-        current_frame_ids = set()
-        if results[0].boxes.id is not None:
+        # Initial resize to base coordinate system (800x600)
+        frame = cv2.resize(frame, (800, 600))
+        
+        # --- 3. CROP & NORMALIZE LIGHTING ---
+        crop_img = frame[y1:y2, x1:x2].copy()
+        
+        # Apply CLAHE to normalize lighting (improves detection in shadows/glare)
+        lab = cv2.cvtColor(crop_img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l = clahe.apply(l)
+        lab = cv2.merge((l, a, b))
+        normalized_crop = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+        # Prepare the display view (using normalized image so you can see what the AI sees)
+        display_crop = cv2.resize(normalized_crop, (view_w, view_h))
+        
+        # --- 4. RUN TRACKER ---
+        # High resolution and low confidence for maximum sensitivity
+        results = model.track(normalized_crop, imgsz=1280, persist=True, verbose=False, conf=0.05, iou=0.5)
+
+        items_in_sink = []
+        items_outside = []
+
+        if results[0].boxes is not None and results[0].boxes.id is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy()
-            track_ids = results[0].boxes.id.int().cpu().numpy()
+            tids = results[0].boxes.id.int().cpu().numpy()
             clss = results[0].boxes.cls.int().cpu().numpy()
 
-            for box, track_id, cls_id in zip(boxes, track_ids, clss):
-                tid = int(track_id)
-                current_frame_ids.add(tid)
-                x1, y1, x2, y2 = box
-                xi1, yi1, xi2, yi2 = int(x1), int(y1), int(x2), int(y2)
-                center_point = (int((x1 + x2) / 2), int((y1 + y2) / 2))
-                in_sink = is_point_in_sink(center_point, sink_polygon)
-
-                class_name = _get_class_name(model, cls_id)
+            for box, tid, cls_id in zip(boxes, tids, clss):
+                # Scale boxes to match display_crop (650x600)
+                bx1, by1, bx2, by2 = box
+                dbx1, dby1 = int(bx1 * scale_x), int(by1 * scale_y)
+                dbx2, dby2 = int(bx2 * scale_x), int(by2 * scale_y)
+                
+                center = (int((bx1 + bx2) / 2), int((by1 + by2) / 2))
+                in_sink = is_point_in_sink(center, sink_poly_cropped)
+                name = _get_class_name(model, cls_id)
+                label = f"{name} #{tid}"
 
                 if in_sink:
-                    cv2.rectangle(frame, (xi1, yi1), (xi2, yi2), (0, 0, 255), 2)
-                    if tid not in sink_inventory:
-                        sink_inventory[tid] = {'entry_time': current_time, 'status': 'VISIBLE'}
-                        entered_this_clip.add(tid)
-                        if DEBUG:
-                            print(f"  [DEBUG] frame {frame_idx} track_id={tid} {class_name} center={center_point} -> ENTERED sink")
-                    elif DEBUG and frame_idx % 30 == 0:
-                        print(f"  [DEBUG] frame {frame_idx} track_id={tid} {class_name} -> in sink (still)")
+                    items_in_sink.append(label)
+                    sink_inventory[tid] = {'status': 'active'}
+                    color = (0, 0, 255) # Red
                 else:
-                    cv2.rectangle(frame, (xi1, yi1), (xi2, yi2), (0, 255, 0), 2)
-                    if tid in sink_inventory:
-                        left_this_clip.add(tid)
-                        del sink_inventory[tid]
-                        if DEBUG:
-                            print(f"  [DEBUG] frame {frame_idx} track_id={tid} {class_name} center={center_point} -> LEFT sink")
+                    items_outside.append(label)
+                    if tid in sink_inventory: del sink_inventory[tid]
+                    color = (0, 255, 0) # Green
 
-                # Label: cup, bowl, pan + track id
-                label = f"{class_name} #{tid}"
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                cv2.rectangle(frame, (xi1, yi1 - th - 4), (xi1 + tw, yi1), (0, 0, 0), -1)
-                cv2.putText(frame, label, (xi1, yi1 - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                # Draw rectangles and labels
+                cv2.rectangle(display_crop, (dbx1, dby1), (dbx2, dby2), color, 2)
+                cv2.putText(display_crop, label, (dbx1, dby1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
 
-        # Draw UI
-        cv2.polylines(frame, [sink_polygon], True, (255, 255, 0), 2)
-        cv2.imshow("YOLO-World Dish Monitor", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        # Always draw the yellow sink boundary
+        cv2.polylines(display_crop, [sink_poly_scaled], True, (255, 255, 0), 2)
+
+        # --- 5. CREATE FINAL UI ---
+        final_ui = np.zeros((600, 800, 3), dtype=np.uint8)
+        final_ui[:, 150:] = display_crop
+        
+        # Sidebar
+        sidebar_w = 150
+        cv2.rectangle(final_ui, (0, 0), (sidebar_w, 600), (20, 20, 20), -1)
+        cv2.line(final_ui, (sidebar_w, 0), (sidebar_w, 600), (200, 200, 200), 1)
+
+        # Sidebar Text
+        cv2.putText(final_ui, f"FR: {frame_idx}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        cv2.putText(final_ui, "IN SINK", (10, 60), cv2.FONT_HERSHEY_TRIPLEX, 0.5, (0, 0, 255), 1)
+        y_pos = 85
+        for item in items_in_sink[:10]:
+            cv2.putText(final_ui, f"> {item}", (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            y_pos += 20
+
+        cv2.putText(final_ui, "OUTSIDE", (10, 300), cv2.FONT_HERSHEY_TRIPLEX, 0.5, (0, 255, 0), 1)
+        y_pos = 325
+        for item in items_outside[:10]:
+            cv2.putText(final_ui, f"> {item}", (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+            y_pos += 20
+
+        cv2.imshow("Dish Monitor Debugger", final_ui)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
 
     cap.release()
-    in_sink_at_end = set(sink_inventory.keys())
-
-    # Per-clip summary
-    print(f"\n--- After clip {clip_index} ({clip_name}) ---")
-    if in_sink_at_end:
-        for tid in sorted(in_sink_at_end):
-            print(f"  Dish {tid} is in the set.")
-    else:
-        print("  No dishes in the set.")
-    if entered_this_clip:
-        for tid in sorted(entered_this_clip):
-            print(f"  Dish {tid} entered the set during this clip.")
-    if left_this_clip:
-        for tid in sorted(left_this_clip):
-            print(f"  Dish {tid} left the set during this clip.")
-    print(f"  Summary: in_sink_now={sorted(in_sink_at_end)} | entered_this_clip={sorted(entered_this_clip)} | left_this_clip={sorted(left_this_clip)}")
-    if DEBUG:
-        print(f"  [DEBUG] in_sink_at_start={sorted(in_sink_at_start)}")
-
-    return {
-        "in_sink_at_end": in_sink_at_end,
-        "entered_this_clip": entered_this_clip,
-        "left_this_clip": left_this_clip,
-    }
 
 # --- MAIN EXECUTION ---
 if __name__ == "__main__":
