@@ -14,7 +14,20 @@ from ultralytics import YOLO
 
 # --- CONFIGURATION ---
 # YOLO-World: prompt-based classes (no COCO IDs). Detects cups, bowls, pans.
-PROMPT_CLASSES = ["white ceramic bowl", "clear cup", "mug", "pot", "pan", "white plate"]
+PROMPT_CLASSES = [
+    "blue plastic bowl",
+    "white ceramic coffee mug",
+    "blue ceramic mug",
+    "clear glass cup",
+    "stainless steel pot",
+    "black frying pan",
+    "silver metal pot lid",
+    "clear plastic food container",
+    "silver metal spoon",
+    "silver metal fork",
+    "rectangular glass baking dish",
+    "white ceramic plate"
+]
 ALERT_THRESHOLD = 5
 DISH_VIDEOS_DIR = "./dish_videos"
 SINK_POLYGON_FILE = "sink_polygon.json"
@@ -112,6 +125,7 @@ def _get_class_name(model, cls_id):
     if isinstance(names, (list, tuple)) and 0 <= cid < len(names):
         return names[cid]
     return f"class_{cid}"
+
 def process_video(video_path, clip_index=None, clip_name=None, model=None):
     global sink_inventory
     clip_index = clip_index if clip_index is not None else 0
@@ -119,7 +133,7 @@ def process_video(video_path, clip_index=None, clip_name=None, model=None):
 
     if model is None:
         model = YOLO(YOLOWORLD_MODEL)
-        model.set_classes(["white ceramic bowl", "clear cup", "mug", "pot", "pan", "white plate"])
+        model.set_classes(PROMPT_CLASSES)
 
     # --- 1. PREPARE LIGHTING NORMALIZATION (CLAHE) ---
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -133,14 +147,10 @@ def process_video(video_path, clip_index=None, clip_name=None, model=None):
     x1, y1 = max(0, sx - pad), max(0, sy - pad)
     x2, y2 = min(800, sx + sw + pad), min(600, sy + sh + pad)
     
-    # Adjust the polygon for the crop
     sink_poly_cropped = original_sink_poly - [x1, y1]
 
-    # Pre-calculate scaling for the display
-    view_w = 650
-    view_h = 600
-    scale_x = view_w / (x2 - x1)
-    scale_y = view_h / (y2 - y1)
+    view_w, view_h = 650, 600
+    scale_x, scale_y = view_w / (x2 - x1), view_h / (y2 - y1)
     sink_poly_scaled = (sink_poly_cropped * [scale_x, scale_y]).astype(np.int32)
 
     frame_idx = 0
@@ -150,84 +160,69 @@ def process_video(video_path, clip_index=None, clip_name=None, model=None):
         frame_idx += 1
         if frame_idx % 4 != 0: continue 
 
-        # Initial resize to base coordinate system (800x600)
         frame = cv2.resize(frame, (800, 600))
-        
-        # --- 3. CROP & NORMALIZE LIGHTING ---
         crop_img = frame[y1:y2, x1:x2].copy()
         
-        # Apply CLAHE to normalize lighting (improves detection in shadows/glare)
         lab = cv2.cvtColor(crop_img, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         l = clahe.apply(l)
-        lab = cv2.merge((l, a, b))
-        normalized_crop = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-        # Prepare the display view (using normalized image so you can see what the AI sees)
+        normalized_crop = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
         display_crop = cv2.resize(normalized_crop, (view_w, view_h))
         
-        # --- 4. RUN TRACKER ---
-        # High resolution and low confidence for maximum sensitivity
-        results = model.track(normalized_crop, imgsz=1280, persist=True, verbose=False, conf=0.05, iou=0.5)
+        # --- 3. RUN TRACKER ---
+        results = model.track(normalized_crop, imgsz=1280, persist=True, verbose=False, conf=0.1, iou=0.5)
 
-        items_in_sink = []
-        items_outside = []
-
+        # 4. UPDATED STICKY LOGIC: Store both Name and Zone
         if results[0].boxes is not None and results[0].boxes.id is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy()
             tids = results[0].boxes.id.int().cpu().numpy()
             clss = results[0].boxes.cls.int().cpu().numpy()
 
             for box, tid, cls_id in zip(boxes, tids, clss):
-                # Scale boxes to match display_crop (650x600)
                 bx1, by1, bx2, by2 = box
-                dbx1, dby1 = int(bx1 * scale_x), int(by1 * scale_y)
-                dbx2, dby2 = int(bx2 * scale_x), int(by2 * scale_y)
-                
                 center = (int((bx1 + bx2) / 2), int((by1 + by2) / 2))
                 in_sink = is_point_in_sink(center, sink_poly_cropped)
+                
+                # Get the descriptive name (e.g., "blue plastic bowl")
                 name = _get_class_name(model, cls_id)
-                label = f"{name} #{tid}"
+                
+                # Update inventory with the description and current zone
+                sink_inventory[tid] = {"name": name, "zone": "in_sink" if in_sink else "outside"}
 
-                if in_sink:
-                    items_in_sink.append(label)
-                    sink_inventory[tid] = {'status': 'active'}
-                    color = (0, 0, 255) # Red
-                else:
-                    items_outside.append(label)
-                    if tid in sink_inventory: del sink_inventory[tid]
-                    color = (0, 255, 0) # Green
-
-                # Draw rectangles and labels
+                # Draw rectangles for currently visible items
+                dbx1, dby1 = int(bx1 * scale_x), int(by1 * scale_y)
+                dbx2, dby2 = int(bx2 * scale_x), int(by2 * scale_y)
+                color = (0, 0, 255) if in_sink else (0, 255, 0)
                 cv2.rectangle(display_crop, (dbx1, dby1), (dbx2, dby2), color, 2)
-                cv2.putText(display_crop, label, (dbx1, dby1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+                cv2.putText(display_crop, f"{name} #{tid}", (dbx1, dby1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-        # Always draw the yellow sink boundary
-        cv2.polylines(display_crop, [sink_poly_scaled], True, (255, 255, 0), 2)
+        # 5. UI RENDERING: Use the stored names for the sidebar
+        items_in_sink = [f"{data['name']} #{tid}" for tid, data in sink_inventory.items() if data['zone'] == "in_sink"]
+        items_outside = [f"{data['name']} #{tid}" for tid, data in sink_inventory.items() if data['zone'] == "outside"]
 
-        # --- 5. CREATE FINAL UI ---
+        # Final UI Assembly
         final_ui = np.zeros((600, 800, 3), dtype=np.uint8)
         final_ui[:, 150:] = display_crop
         
-        # Sidebar
         sidebar_w = 150
         cv2.rectangle(final_ui, (0, 0), (sidebar_w, 600), (20, 20, 20), -1)
         cv2.line(final_ui, (sidebar_w, 0), (sidebar_w, 600), (200, 200, 200), 1)
 
-        # Sidebar Text
         cv2.putText(final_ui, f"FR: {frame_idx}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        
         cv2.putText(final_ui, "IN SINK", (10, 60), cv2.FONT_HERSHEY_TRIPLEX, 0.5, (0, 0, 255), 1)
         y_pos = 85
-        for item in items_in_sink[:10]:
-            cv2.putText(final_ui, f"> {item}", (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        for item in items_in_sink[:12]:
+            cv2.putText(final_ui, f"> {item}", (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
             y_pos += 20
 
-        cv2.putText(final_ui, "OUTSIDE", (10, 300), cv2.FONT_HERSHEY_TRIPLEX, 0.5, (0, 255, 0), 1)
-        y_pos = 325
+        cv2.putText(final_ui, "OUTSIDE", (10, 350), cv2.FONT_HERSHEY_TRIPLEX, 0.5, (0, 255, 0), 1)
+        y_pos = 375
         for item in items_outside[:10]:
-            cv2.putText(final_ui, f"> {item}", (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+            cv2.putText(final_ui, f"> {item}", (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
             y_pos += 20
 
+        cv2.polylines(display_crop, [sink_poly_scaled], True, (255, 255, 0), 2)
         cv2.imshow("Dish Monitor Debugger", final_ui)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
 
